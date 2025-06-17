@@ -10,6 +10,7 @@ import torch
         x_names=['x1_size', 'x2_size', 'rd_size'],
         x_vals=[2**i for i in range(5, 15, 1)],
         x_log=True,
+        y_log=True,
         line_arg='provider',
         line_vals=['triton', 'torch'],
         line_names=['Triton', 'Torch'],
