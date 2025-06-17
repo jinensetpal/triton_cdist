@@ -128,6 +128,7 @@ def pairwise_lp_backward_kernel(
     x1_ptr,
     x2_ptr,
     fwd_res_ptr,
+    fwd_grad_ptr,
     x1_grad_ptr,
     x2_grad_ptr,
     out_d1, out_d2, reduced_dim,
@@ -148,26 +149,28 @@ def pairwise_lp_backward_kernel(
 
     offs_x1 = (offs_d1[:, None] * stride_x11 + offs_rd[None, :] * stride_x12)
     offs_x2 = (offs_d2[:, None] * stride_x21 + offs_rd[None, :] * stride_x22)
-    offs_fwdr = (offs_d1[:, None] * out_d2) + (offs_d2[None, :])
+    offs_fwd = (offs_d1[:, None] * out_d2) + (offs_d2[None, :])
 
     x1_ptrs = x1_ptr + offs_x1
     x2_ptrs = x2_ptr + offs_x2
-    fwdr_ptrs = fwd_res_ptr + offs_fwdr
+    fwdr_ptrs = fwd_res_ptr + offs_fwd
+    fwdg_ptrs = fwd_grad_ptr + offs_fwd
     x1_grad_ptrs = x1_grad_ptr + offs_x1
     x2_grad_ptrs = x2_grad_ptr + offs_x2
 
     x1_mask = (offs_d1 < out_d1)[:, None] & (offs_rd < reduced_dim)[None, :]
     x2_mask = (offs_d2 < out_d2)[:, None] & (offs_rd < reduced_dim)[None, :]
-    fwdr_mask = (offs_d1 < out_d1)[:, None] & (offs_d2 < out_d2)[None, :]
+    fwd_mask = (offs_d1 < out_d1)[:, None] & (offs_d2 < out_d2)[None, :]
 
     x1 = tl.expand_dims(tl.load(x1_ptrs, mask=x1_mask), -2)
     x2 = tl.load(x2_ptrs, mask=x2_mask)
-    fwdr = tl.load(fwdr_ptrs, mask=fwdr_mask, other=float('inf'))
+    fwdr = tl.load(fwdr_ptrs, mask=fwd_mask, other=float('inf'))
+    fwdg = tl.load(fwdg_ptrs, mask=fwd_mask)
 
     pairwise_diff = (x1 - x2).permute(2, 0, 1)
     abs_log_diff = tl.log(pairwise_diff.abs())
     grad_partial = (((pairwise_diff > 0) * 2) - 1) * tl.exp(abs_log_diff * (p - 1)) / fwdr
-    grad_partial = tl.where(abs_log_diff == float('-inf'), 0., grad_partial)
+    grad_partial = fwdg * tl.where(abs_log_diff == float('-inf'), 0., grad_partial)
 
     grad_mask = (tl.expand_dims(x1_mask, -2) & x2_mask).permute(2, 0, 1)
     x1_grad_partial = tl.sum(tl.where(grad_mask, grad_partial, 0.), -1).trans()
@@ -179,20 +182,20 @@ def pairwise_lp_backward_kernel(
 
 @triton_op("triton_cdist::opt_cdist_singular_backward", mutates_args={})
 @torch.compile(fullgraph=True)
-def opt_cdist_singular_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: torch.Tensor, p: float) -> List[torch.Tensor]:
+def opt_cdist_singular_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: torch.Tensor, fwd_grad: torch.Tensor, p: float) -> List[torch.Tensor]:
     x1_grad = torch.zeros_like(x1)
     x2_grad = torch.zeros_like(x2)
 
     grid = lambda meta: (triton.cdiv(x1.size(0), meta["BLOCK_SIZE_X1"]), triton.cdiv(x2.size(0), meta["BLOCK_SIZE_X2"]), triton.cdiv(x1.size(1), meta["BLOCK_SIZE_RD"]))
 
-    pairwise_lp_backward_kernel[grid](x1, x2, fwd_res, x1_grad, x2_grad, *fwd_res.shape, x1.size(1),
+    pairwise_lp_backward_kernel[grid](x1, x2, fwd_res, fwd_grad, x1_grad, x2_grad, *fwd_res.shape, x1.size(1),
                                       x1.stride(0), x1.stride(1), x2.stride(0), x2.stride(1), p)
 
     return x1_grad, x2_grad
 
 
 @triton_op("triton_cdist::opt_cdist_backward", mutates_args={})
-def opt_cdist_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: torch.Tensor, p: float = 2.) -> List[torch.Tensor]:
+def opt_cdist_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: torch.Tensor, fwd_grad: torch.Tensor, p: float = 2.) -> List[torch.Tensor]:
     batched_x1 = False
     batched_x2 = False
     n_batches = -1
@@ -206,7 +209,7 @@ def opt_cdist_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: torch.Tensor
 
     if batched_x1 and batched_x2:
         logging.warning('Naive and slow batching')
-        gradients = [opt_cdist_singular_backward(x1i, x2j, frk, p) for x1i, x2j, frk in zip(x1, x2, fwd_res)]
+        gradients = [opt_cdist_singular_backward(x1i, x2j, frk, frg, p) for x1i, x2j, frk in zip(x1, x2, fwd_grad, fwd_res)]
 
         x1_grad = []
         x2_grad = []
@@ -215,17 +218,17 @@ def opt_cdist_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: torch.Tensor
             x2_grad.append(gradients[i][1][None,])
 
         return torch.vstack(x1_grad), torch.vstack(x2_grad)
-    if not batched_x1 and not batched_x2: return opt_cdist_singular_backward(x1, x2, fwd_res, p)
+    if not batched_x1 and not batched_x2: return opt_cdist_singular_backward(x1, x2, fwd_res, fwd_grad, p)
 
     out_d1 = x1.size(1 if batched_x1 else 0)
     out_d2 = x2.size(1 if batched_x2 else 0)
     rd = x1.size(-1)
 
     if batched_x1:
-        x1_grad, x2_grad = opt_cdist_singular_backward(x1.view(-1, rd), x2, fwd_res.view(-1, out_d2), p)
+        x1_grad, x2_grad = opt_cdist_singular_backward(x1.view(-1, rd), x2, fwd_res.view(-1, out_d2), fwd_grad, p)
         x1_grad = x1_grad.view(n_batches, out_d1, rd)
     elif batched_x2:
-        x2_grad, x1_grad = opt_cdist_singular_backward(x2.view(-1, rd), x1, fwd_res.transpose(-1, -2).reshape(-1, out_d1), p)
+        x2_grad, x1_grad = opt_cdist_singular_backward(x2.view(-1, rd), x1, fwd_res.transpose(-1, -2).reshape(-1, out_d1), fwd_grad, p)
         x2_grad = x2_grad.view(n_batches, out_d2, rd)
     return x1_grad, x2_grad
 
@@ -234,7 +237,7 @@ def backward(ctx, grad):
     x1, x2, fwd_res = ctx.saved_tensors
     p = ctx.p
 
-    x1_grad, x2_grad = opt_cdist_backward(x1, x2, fwd_res.pow(p - 1), p)
+    x1_grad, x2_grad = opt_cdist_backward(x1, x2, fwd_res.pow(p - 1), grad, p)
     return x1_grad, x2_grad, None
 
 
@@ -244,7 +247,7 @@ def cdist_fallback(x1, x2, p=2.):
 
 
 @opt_cdist_backward.register_kernel('cpu')
-def cdist_backward_fallback(x1, x2, fwd_res, p=2.):
+def cdist_backward_fallback(x1, x2, fwd_res, fwd_grad, p=2.):
     batched_x1 = False
     batched_x2 = False
     n_batches = -1
@@ -262,7 +265,7 @@ def cdist_backward_fallback(x1, x2, fwd_res, p=2.):
 
     if batched_x1 and batched_x2:
         logging.warning('Naive and slow batching')
-        gradients = [cdist_singular_backward_fallback(x1i, x2j, frk, p) for x1i, x2j, frk in zip(x1, x2, fwd_res)]
+        gradients = [cdist_singular_backward_fallback(x1i, x2j, frk, frg, p) for x1i, x2j, frk in zip(x1, x2, fwd_res, fwd_grad)]
 
         x1_grad = []
         x2_grad = []
@@ -271,22 +274,22 @@ def cdist_backward_fallback(x1, x2, fwd_res, p=2.):
             x2_grad.append(gradients[i][1][None,])
 
         return torch.vstack(x1_grad), torch.vstack(x2_grad)
-    if not batched_x1 and not batched_x2: return cdist_singular_backward_fallback(x1, x2, fwd_res, p)
+    if not batched_x1 and not batched_x2: return cdist_singular_backward_fallback(x1, x2, fwd_res, fwd_grad, p)
 
     if batched_x1:
-        x1_grad, x2_grad = cdist_singular_backward_fallback(x1.view(-1, rd), x2, fwd_res.view(-1, out_d2), p)
+        x1_grad, x2_grad = cdist_singular_backward_fallback(x1.view(-1, rd), x2, fwd_res.view(-1, out_d2), fwd_grad, p)
         x1_grad = x1_grad.view(n_batches, out_d1, rd)
     elif batched_x2:
-        x2_grad, x1_grad = cdist_singular_backward_fallback(x2.view(-1, rd), x1, fwd_res.transpose(-1, -2).reshape(-1, out_d1), p)
+        x2_grad, x1_grad = cdist_singular_backward_fallback(x2.view(-1, rd), x1, fwd_res.transpose(-1, -2).reshape(-1, out_d1), fwd_grad, p)
         x2_grad = x2_grad.view(n_batches, out_d2, rd)
     return x1_grad, x2_grad
 
 
-def cdist_singular_backward_fallback(x1, x2, fwd_res, p):
+def cdist_singular_backward_fallback(x1, x2, fwd_res, fwd_grad, p):
     partial_grad = (x1.unsqueeze(1) - x2).permute(2, 0, 1)
     partial_grad *= partial_grad.abs().pow(p - 2)
     partial_grad /= fwd_res.pow(p - 1)
-    partial_grad = torch.where(partial_grad.isnan(), 0, partial_grad)
+    partial_grad = fwd_grad * torch.where(partial_grad.isnan(), 0, partial_grad)
 
     x1_grad = partial_grad.sum(-1).transpose(0, 1)
     x2_grad = -partial_grad.sum(1).transpose(0, 1)
@@ -302,11 +305,11 @@ opt_cdist.register_autograd(backward, setup_context=setup_context)
 
 
 if __name__ == '__main__':
-    x1 = torch.randn(2, 128, 32, device='cpu', requires_grad=True)
-    x2 = torch.randn(128, 32, device='cpu', requires_grad=True)
+    x1 = torch.randn(2, 128, 32, device='cuda', requires_grad=True)
+    x2 = torch.randn(128, 32, device='cuda', requires_grad=True)
     print(x1, x2, sep='\n')
 
-    p = 1.
+    p = 2.
     out = opt_cdist(x1, x2, p=p)
     target = torch.cdist(x1, x2, p=p)
     print('Forward:', torch.allclose(out, target), (target - out).abs().max())
