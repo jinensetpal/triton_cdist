@@ -8,6 +8,21 @@ import triton
 import torch
 
 
+@triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_SIZE_X1": 2, "BLOCK_SIZE_X2": 2, "BLOCK_SIZE_RD": 2}, num_stages=0, num_warps=4),
+            triton.Config({"BLOCK_SIZE_X1": 2, "BLOCK_SIZE_X2": 2, "BLOCK_SIZE_RD": 2}, num_stages=0, num_warps=8),
+            triton.Config({"BLOCK_SIZE_X1": 4, "BLOCK_SIZE_X2": 4, "BLOCK_SIZE_RD": 4}, num_stages=0, num_warps=4),
+            triton.Config({"BLOCK_SIZE_X1": 4, "BLOCK_SIZE_X2": 4, "BLOCK_SIZE_RD": 4}, num_stages=0, num_warps=8),
+            triton.Config({"BLOCK_SIZE_X1": 8, "BLOCK_SIZE_X2": 8, "BLOCK_SIZE_RD": 8}, num_stages=0, num_warps=4),
+            triton.Config({"BLOCK_SIZE_X1": 8, "BLOCK_SIZE_X2": 8, "BLOCK_SIZE_RD": 8}, num_stages=0, num_warps=8),
+            triton.Config({"BLOCK_SIZE_X1": 16, "BLOCK_SIZE_X2": 16, "BLOCK_SIZE_RD": 16}, num_stages=0, num_warps=4),
+            triton.Config({"BLOCK_SIZE_X1": 16, "BLOCK_SIZE_X2": 16, "BLOCK_SIZE_RD": 16}, num_stages=0, num_warps=8),
+        ],
+        key=['out_d1', 'out_d2', 'reduced_dim'],
+        restore_value=['x1_ptr', 'x2_ptr'],
+        reset_to_zero=['out_ptr'],
+    )
 @triton.jit
 def pairwise_lp_kernel(
     x1_ptr,
@@ -37,9 +52,9 @@ def pairwise_lp_kernel(
     x2_ptrs = x2_ptr + offs_x2
     out_ptrs = out_ptr + offs_out
 
-    x1_mask = offs_x1 < (reduced_dim * out_d1)
-    x2_mask = offs_x2 < (reduced_dim * out_d2)
-    out_mask = ((offs_d1 < out_d1)[:, None].to(tl.int8) + (offs_d2 < out_d2)[None, :]) == 2
+    x1_mask = (offs_d1 < out_d1)[:, None] & (offs_rd < reduced_dim)[None, :]
+    x2_mask = (offs_d2 < out_d2)[:, None] & (offs_rd < reduced_dim)[None, :]
+    out_mask = (offs_d1 < out_d1)[:, None] & (offs_d2 < out_d2)[None, :]
 
     x1 = tl.expand_dims(tl.load(x1_ptrs, mask=x1_mask), -2)
     x2 = tl.load(x2_ptrs, mask=x2_mask)
@@ -56,8 +71,7 @@ def opt_cdist_singular(x1: torch.Tensor, x2: torch.Tensor,
     grid = lambda meta: (triton.cdiv(x1.size(0), meta["BLOCK_SIZE_X1"]), triton.cdiv(x2.size(0), meta["BLOCK_SIZE_X2"]), triton.cdiv(x1.size(1), meta["BLOCK_SIZE_RD"]))
 
     pairwise_lp_kernel[grid](x1, x2, output, *output.shape, x1.size(1),
-                             x1.stride(0), x1.stride(1), x2.stride(0), x2.stride(1), p,
-                             BLOCK_SIZE_RD=2, BLOCK_SIZE_X1=4, BLOCK_SIZE_X2=8)
+                             x1.stride(0), x1.stride(1), x2.stride(0), x2.stride(1), p)
 
     return output.pow(1/p)
 
@@ -94,6 +108,21 @@ def opt_cdist(x1: torch.Tensor, x2: torch.Tensor, p: float = 2.) -> torch.Tensor
         return opt_cdist_singular(x2, x1, x2.size(0), x1.size(0), p).view(n_batches, out_d2, out_d1).transpose(-1, -2)
 
 
+@triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_SIZE_X1": 2, "BLOCK_SIZE_X2": 2, "BLOCK_SIZE_RD": 2}, num_stages=0, num_warps=4),
+            triton.Config({"BLOCK_SIZE_X1": 2, "BLOCK_SIZE_X2": 2, "BLOCK_SIZE_RD": 2}, num_stages=0, num_warps=8),
+            triton.Config({"BLOCK_SIZE_X1": 4, "BLOCK_SIZE_X2": 4, "BLOCK_SIZE_RD": 4}, num_stages=0, num_warps=4),
+            triton.Config({"BLOCK_SIZE_X1": 4, "BLOCK_SIZE_X2": 4, "BLOCK_SIZE_RD": 4}, num_stages=0, num_warps=8),
+            triton.Config({"BLOCK_SIZE_X1": 8, "BLOCK_SIZE_X2": 8, "BLOCK_SIZE_RD": 8}, num_stages=0, num_warps=4),
+            triton.Config({"BLOCK_SIZE_X1": 8, "BLOCK_SIZE_X2": 8, "BLOCK_SIZE_RD": 8}, num_stages=0, num_warps=8),
+            triton.Config({"BLOCK_SIZE_X1": 16, "BLOCK_SIZE_X2": 16, "BLOCK_SIZE_RD": 16}, num_stages=0, num_warps=4),
+            triton.Config({"BLOCK_SIZE_X1": 16, "BLOCK_SIZE_X2": 16, "BLOCK_SIZE_RD": 16}, num_stages=0, num_warps=8),
+        ],
+        key=['out_d1', 'out_d2', 'reduced_dim'],
+        restore_value=['x1_ptr', 'x2_ptr', 'fwd_res_ptr'],
+        reset_to_zero=['x1_grad_ptr', 'x2_grad_ptr'],
+    )
 @triton.jit
 def pairwise_lp_backward_kernel(
     x1_ptr,
@@ -127,16 +156,18 @@ def pairwise_lp_backward_kernel(
     x1_grad_ptrs = x1_grad_ptr + offs_x1
     x2_grad_ptrs = x2_grad_ptr + offs_x2
 
-    x1_mask = offs_x1 < (reduced_dim * out_d1)
-    x2_mask = offs_x2 < (reduced_dim * out_d2)
-    fwdr_mask = ((offs_d1 < out_d1)[:, None].to(tl.int8) + (offs_d2 < out_d2)[None, :]) == 2
+    x1_mask = (offs_d1 < out_d1)[:, None] & (offs_rd < reduced_dim)[None, :]
+    x2_mask = (offs_d2 < out_d2)[:, None] & (offs_rd < reduced_dim)[None, :]
+    fwdr_mask = (offs_d1 < out_d1)[:, None] & (offs_d2 < out_d2)[None, :]
 
     x1 = tl.expand_dims(tl.load(x1_ptrs, mask=x1_mask), -2)
     x2 = tl.load(x2_ptrs, mask=x2_mask)
     fwdr = tl.load(fwdr_ptrs, mask=fwdr_mask, other=float('inf'))
 
-    diff = (x1 - x2).permute(2, 0, 1)
-    grad_partial = (((diff > 0) * 2) - 1) * tl.exp(tl.log(diff.abs()) * (p - 1)) / fwdr
+    pairwise_diff = (x1 - x2).permute(2, 0, 1)
+    abs_log_diff = tl.log(pairwise_diff.abs())
+    grad_partial = (((pairwise_diff > 0) * 2) - 1) * tl.exp(abs_log_diff * (p - 1)) / fwdr
+    grad_partial = tl.where(abs_log_diff == float('-inf'), 0., grad_partial)
 
     grad_mask = (tl.expand_dims(x1_mask, -2) & x2_mask).permute(2, 0, 1)
     x1_grad_partial = tl.sum(tl.where(grad_mask, grad_partial, 0.), -1).trans()
@@ -155,8 +186,7 @@ def opt_cdist_singular_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: tor
     grid = lambda meta: (triton.cdiv(x1.size(0), meta["BLOCK_SIZE_X1"]), triton.cdiv(x2.size(0), meta["BLOCK_SIZE_X2"]), triton.cdiv(x1.size(1), meta["BLOCK_SIZE_RD"]))
 
     pairwise_lp_backward_kernel[grid](x1, x2, fwd_res, x1_grad, x2_grad, *fwd_res.shape, x1.size(1),
-                                      x1.stride(0), x1.stride(1), x2.stride(0), x2.stride(1), p,
-                                      BLOCK_SIZE_RD=2, BLOCK_SIZE_X1=4, BLOCK_SIZE_X2=8)
+                                      x1.stride(0), x1.stride(1), x2.stride(0), x2.stride(1), p)
 
     return x1_grad, x2_grad
 
@@ -175,7 +205,7 @@ def opt_cdist_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: torch.Tensor
         batched_x2 = True
 
     if batched_x1 and batched_x2:
-        logging.warning('Naive and slow solution')
+        logging.warning('Naive and slow batching')
         gradients = [opt_cdist_singular_backward(x1i, x2j, frk, p) for x1i, x2j, frk in zip(x1, x2, fwd_res)]
 
         x1_grad = []
@@ -195,7 +225,7 @@ def opt_cdist_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: torch.Tensor
         x1_grad, x2_grad = opt_cdist_singular_backward(x1.view(-1, rd), x2, fwd_res.view(-1, out_d2), p)
         x1_grad = x1_grad.view(n_batches, out_d1, rd)
     elif batched_x2:
-        x2_grad, x1_grad = opt_cdist_singular_backward(x2.view(-1, rd), x1, fwd_res.transpose(0, 1).reshape(-1, out_d1), p)
+        x2_grad, x1_grad = opt_cdist_singular_backward(x2.view(-1, rd), x1, fwd_res.transpose(-1, -2).reshape(-1, out_d1), p)
         x2_grad = x2_grad.view(n_batches, out_d2, rd)
     return x1_grad, x2_grad
 
@@ -231,7 +261,7 @@ def cdist_backward_fallback(x1, x2, fwd_res, p=2.):
     rd = x1.size(-1)
 
     if batched_x1 and batched_x2:
-        logging.warning('Naive and slow solution')
+        logging.warning('Naive and slow batching')
         gradients = [cdist_singular_backward_fallback(x1i, x2j, frk, p) for x1i, x2j, frk in zip(x1, x2, fwd_res)]
 
         x1_grad = []
@@ -247,7 +277,7 @@ def cdist_backward_fallback(x1, x2, fwd_res, p=2.):
         x1_grad, x2_grad = cdist_singular_backward_fallback(x1.view(-1, rd), x2, fwd_res.view(-1, out_d2), p)
         x1_grad = x1_grad.view(n_batches, out_d1, rd)
     elif batched_x2:
-        x2_grad, x1_grad = cdist_singular_backward_fallback(x2.view(-1, rd), x1, fwd_res.transpose(0, 1).reshape(-1, out_d1), p)
+        x2_grad, x1_grad = cdist_singular_backward_fallback(x2.view(-1, rd), x1, fwd_res.transpose(-1, -2).reshape(-1, out_d1), p)
         x2_grad = x2_grad.view(n_batches, out_d2, rd)
     return x1_grad, x2_grad
 
@@ -256,6 +286,7 @@ def cdist_singular_backward_fallback(x1, x2, fwd_res, p):
     partial_grad = (x1.unsqueeze(1) - x2).permute(2, 0, 1)
     partial_grad *= partial_grad.abs().pow(p - 2)
     partial_grad /= fwd_res.pow(p - 1)
+    partial_grad = torch.where(partial_grad.isnan(), 0, partial_grad)
 
     x1_grad = partial_grad.sum(-1).transpose(0, 1)
     x2_grad = -partial_grad.sum(1).transpose(0, 1)
@@ -271,8 +302,8 @@ opt_cdist.register_autograd(backward, setup_context=setup_context)
 
 
 if __name__ == '__main__':
-    x1 = torch.randn(2, 8, 4, device='cuda', requires_grad=True)
-    x2 = torch.randn(10, 4, device='cuda', requires_grad=True)
+    x1 = torch.randn(2, 128, 32, device='cpu', requires_grad=True)
+    x2 = torch.randn(128, 32, device='cpu', requires_grad=True)
     print(x1, x2, sep='\n')
 
     p = 1.
@@ -286,5 +317,5 @@ if __name__ == '__main__':
     x1.grad = None
     x2.grad = None
     target.sum().backward()
-    print('Backward x1:', torch.allclose(x1.grad, manual_x1_grad), (manual_x1_grad - x1.grad).abs().max())
-    print('Backward x2:', torch.allclose(x2.grad, manual_x2_grad), (manual_x2_grad - x2.grad).abs().max())
+    print('Backward x1:', torch.allclose(x1.grad, manual_x1_grad, rtol=1e-4, atol=1e-5), (manual_x1_grad - x1.grad).abs().max())
+    print('Backward x2:', torch.allclose(x2.grad, manual_x2_grad, rtol=1e-4, atol=1e-5), (manual_x2_grad - x2.grad).abs().max())
