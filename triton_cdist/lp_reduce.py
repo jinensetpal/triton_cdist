@@ -188,7 +188,7 @@ def opt_cdist_singular_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: tor
 
     grid = lambda meta: (triton.cdiv(x1.size(0), meta["BLOCK_SIZE_X1"]), triton.cdiv(x2.size(0), meta["BLOCK_SIZE_X2"]), triton.cdiv(x1.size(1), meta["BLOCK_SIZE_RD"]))
 
-    pairwise_lp_backward_kernel[grid](x1, x2, fwd_res, fwd_grad, x1_grad, x2_grad, *fwd_res.shape, x1.size(1),
+    pairwise_lp_backward_kernel[grid](x1, x2, fwd_res, fwd_grad.clone(), x1_grad, x2_grad, *fwd_res.shape, x1.size(1),
                                       x1.stride(0), x1.stride(1), x2.stride(0), x2.stride(1), p)
 
     return x1_grad, x2_grad
@@ -209,7 +209,7 @@ def opt_cdist_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: torch.Tensor
 
     if batched_x1 and batched_x2:
         logging.warning('Naive and slow batching')
-        gradients = [opt_cdist_singular_backward(x1i, x2j, frk, frg, p) for x1i, x2j, frk in zip(x1, x2, fwd_grad, fwd_res)]
+        gradients = [opt_cdist_singular_backward(x1i, x2j, frk, frg, p) for x1i, x2j, frk, frg in zip(x1, x2, fwd_res, fwd_grad)]
 
         x1_grad = []
         x2_grad = []
@@ -225,10 +225,10 @@ def opt_cdist_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: torch.Tensor
     rd = x1.size(-1)
 
     if batched_x1:
-        x1_grad, x2_grad = opt_cdist_singular_backward(x1.view(-1, rd), x2, fwd_res.view(-1, out_d2), fwd_grad, p)
+        x1_grad, x2_grad = opt_cdist_singular_backward(x1.view(-1, rd), x2, fwd_res.view(-1, out_d2), fwd_grad.view(-1, out_d1), p)
         x1_grad = x1_grad.view(n_batches, out_d1, rd)
     elif batched_x2:
-        x2_grad, x1_grad = opt_cdist_singular_backward(x2.view(-1, rd), x1, fwd_res.transpose(-1, -2).reshape(-1, out_d1), fwd_grad, p)
+        x2_grad, x1_grad = opt_cdist_singular_backward(x2.view(-1, rd), x1, fwd_res.transpose(-1, -2).reshape(-1, out_d1), fwd_grad.transpose(-1, -2).reshape(-1, out_d1), p)
         x2_grad = x2_grad.view(n_batches, out_d2, rd)
     return x1_grad, x2_grad
 
@@ -265,7 +265,7 @@ def cdist_backward_fallback(x1, x2, fwd_res, fwd_grad, p=2.):
 
     if batched_x1 and batched_x2:
         logging.warning('Naive and slow batching')
-        gradients = [cdist_singular_backward_fallback(x1i, x2j, frk, frg, p) for x1i, x2j, frk in zip(x1, x2, fwd_res, fwd_grad)]
+        gradients = [cdist_singular_backward_fallback(x1i, x2j, frk, frg, p) for x1i, x2j, frk, frg in zip(x1, x2, fwd_res, fwd_grad)]
 
         x1_grad = []
         x2_grad = []
@@ -277,10 +277,10 @@ def cdist_backward_fallback(x1, x2, fwd_res, fwd_grad, p=2.):
     if not batched_x1 and not batched_x2: return cdist_singular_backward_fallback(x1, x2, fwd_res, fwd_grad, p)
 
     if batched_x1:
-        x1_grad, x2_grad = cdist_singular_backward_fallback(x1.view(-1, rd), x2, fwd_res.view(-1, out_d2), fwd_grad, p)
+        x1_grad, x2_grad = cdist_singular_backward_fallback(x1.view(-1, rd), x2, fwd_res.view(-1, out_d2), fwd_grad.view(-1, out_d1), p)
         x1_grad = x1_grad.view(n_batches, out_d1, rd)
     elif batched_x2:
-        x2_grad, x1_grad = cdist_singular_backward_fallback(x2.view(-1, rd), x1, fwd_res.transpose(-1, -2).reshape(-1, out_d1), fwd_grad, p)
+        x2_grad, x1_grad = cdist_singular_backward_fallback(x2.view(-1, rd), x1, fwd_res.transpose(-1, -2).reshape(-1, out_d1), fwd_grad.transpose(-1, -2).reshape(-1, out_d1), p)
         x2_grad = x2_grad.view(n_batches, out_d2, rd)
     return x1_grad, x2_grad
 
@@ -310,8 +310,8 @@ if __name__ == '__main__':
     print(x1, x2, sep='\n')
 
     p = 2.
-    out = opt_cdist(x1, x2, p=p)
-    target = torch.cdist(x1, x2, p=p)
+    out = opt_cdist(x1.clone(), x2.clone(), p=p)
+    target = torch.cdist(x1.clone(), x2.clone(), p=p)
     print('Forward:', torch.allclose(out, target), (target - out).abs().max())
 
     out.sum().backward()
