@@ -24,8 +24,6 @@ def test_correctness(x1_size, x2_size, rd_size, p):
 
     print('Backward x1:', (manual_x1_grad - x1.grad).abs().max())
     print('Backward x2:', (manual_x2_grad - x2.grad).abs().max())
-    from IPython import embed
-    if manual_x1_grad.isnan().any() or manual_x2_grad.isnan().any(): embed()
     assert torch.allclose(x1.grad, manual_x1_grad, rtol=1e-4, atol=1e-5)
     assert torch.allclose(x2.grad, manual_x2_grad, rtol=1e-4, atol=1e-5)
 

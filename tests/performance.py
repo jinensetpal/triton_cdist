@@ -33,4 +33,6 @@ def benchmark(x1_size, x2_size, rd_size, p, provider):
 
 
 if __name__ == '__main__':
-    benchmark.run(print_data=True, show_plots=True)
+    for p in [1., 2., 10.]:
+        benchmark.benchmarks.args = {'p': p}
+        benchmark.run(print_data=True, show_plots=True)

@@ -62,7 +62,7 @@ def pairwise_lp_kernel(
     tl.atomic_add(out_ptrs, tl.sum(tl.exp(tl.log(tl.abs(x1 - x2)) * p), axis=-1), mask=out_mask)
 
 
-@triton_op("opt_pairwise_lp_dist::opt_cdist_singular", mutates_args={})
+@triton_op("triton_cdist::opt_cdist_singular", mutates_args={})
 @torch.compile(fullgraph=True)
 def opt_cdist_singular(x1: torch.Tensor, x2: torch.Tensor,
                        out_d1: int, out_d2: int,
@@ -76,7 +76,7 @@ def opt_cdist_singular(x1: torch.Tensor, x2: torch.Tensor,
     return output.pow(1/p)
 
 
-@triton_op("opt_pairwise_lp_dist::opt_cdist", mutates_args={})
+@triton_op("triton_cdist::opt_cdist", mutates_args={})
 def opt_cdist(x1: torch.Tensor, x2: torch.Tensor, p: float = 2.) -> torch.Tensor:
     assert x1.size(-1) == x2.size(-1)
 
@@ -177,7 +177,7 @@ def pairwise_lp_backward_kernel(
     tl.atomic_add(x2_grad_ptrs, x2_grad_partial, mask=x2_mask)
 
 
-@triton_op("opt_pairwise_lp_dist::opt_cdist_singular_backward", mutates_args={})
+@triton_op("triton_cdist::opt_cdist_singular_backward", mutates_args={})
 @torch.compile(fullgraph=True)
 def opt_cdist_singular_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: torch.Tensor, p: float) -> List[torch.Tensor]:
     x1_grad = torch.zeros_like(x1)
@@ -191,7 +191,7 @@ def opt_cdist_singular_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: tor
     return x1_grad, x2_grad
 
 
-@triton_op("opt_pairwise_lp_dist::opt_cdist_backward", mutates_args={})
+@triton_op("triton_cdist::opt_cdist_backward", mutates_args={})
 def opt_cdist_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: torch.Tensor, p: float = 2.) -> List[torch.Tensor]:
     batched_x1 = False
     batched_x2 = False
