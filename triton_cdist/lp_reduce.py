@@ -8,13 +8,27 @@ import triton
 import torch
 
 
+def get_autotune_config():
+    return [triton.Config({'BLOCK_SIZE_X1': 16, 'BLOCK_SIZE_X2': 64, 'BLOCK_SIZE_RD': 32}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_SIZE_X1': 32, 'BLOCK_SIZE_X2': 64, 'BLOCK_SIZE_RD': 16}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_SIZE_X1': 16, 'BLOCK_SIZE_X2': 16, 'BLOCK_SIZE_RD': 16}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_SIZE_X1': 16, 'BLOCK_SIZE_X2': 32, 'BLOCK_SIZE_RD': 16}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_SIZE_X1': 32, 'BLOCK_SIZE_X2': 16, 'BLOCK_SIZE_RD': 16}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_SIZE_X1': 16, 'BLOCK_SIZE_X2': 16, 'BLOCK_SIZE_RD': 16}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_SIZE_X1': 32, 'BLOCK_SIZE_X2': 16, 'BLOCK_SIZE_RD': 16}, num_stages=5, num_warps=2),
+            triton.Config({'BLOCK_SIZE_X1': 16, 'BLOCK_SIZE_X2': 32, 'BLOCK_SIZE_RD': 16}, num_stages=5, num_warps=2),
+            triton.Config({'BLOCK_SIZE_X1': 16, 'BLOCK_SIZE_X2': 64, 'BLOCK_SIZE_RD': 16}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_SIZE_X1': 64, 'BLOCK_SIZE_X2': 16, 'BLOCK_SIZE_RD': 16}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_SIZE_X1': 64, 'BLOCK_SIZE_X2': 32, 'BLOCK_SIZE_RD': 16}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_SIZE_X1': 32, 'BLOCK_SIZE_X2': 64, 'BLOCK_SIZE_RD': 16}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_SIZE_X1': 16, 'BLOCK_SIZE_X2': 16, 'BLOCK_SIZE_RD': 16}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_SIZE_X1': 16, 'BLOCK_SIZE_X2': 32, 'BLOCK_SIZE_RD': 32}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_SIZE_X1': 32, 'BLOCK_SIZE_X2': 16, 'BLOCK_SIZE_RD': 32}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_SIZE_X1': 16, 'BLOCK_SIZE_X2': 16, 'BLOCK_SIZE_RD': 32}, num_stages=4, num_warps=4),]
+
+
 @triton.autotune(
-        configs=[
-            triton.Config({"BLOCK_SIZE_X1": 16, "BLOCK_SIZE_X2": 16, "BLOCK_SIZE_RD": 16}, num_stages=0, num_warps=4),
-            triton.Config({"BLOCK_SIZE_X1": 16, "BLOCK_SIZE_X2": 16, "BLOCK_SIZE_RD": 16}, num_stages=0, num_warps=8),
-            triton.Config({"BLOCK_SIZE_X1": 32, "BLOCK_SIZE_X2": 32, "BLOCK_SIZE_RD": 32}, num_stages=0, num_warps=4),
-            triton.Config({"BLOCK_SIZE_X1": 32, "BLOCK_SIZE_X2": 32, "BLOCK_SIZE_RD": 32}, num_stages=0, num_warps=8),
-        ],
+        configs=get_autotune_config(),
         key=['out_d1', 'out_d2', 'reduced_dim'],
         reset_to_zero=['out_ptr'],
     )
@@ -32,29 +46,41 @@ def pairwise_lp_kernel(
     BLOCK_SIZE_X2: tl.constexpr,
 ):
     pid_x1 = tl.program_id(axis=0)
-    pid_x2 = tl.program_id(axis=1)
-    pid_rd = tl.program_id(axis=2)
+    pid_rd = tl.program_id(axis=1)
 
-    offs_d1 = (pid_x1 * BLOCK_SIZE_X1 + tl.arange(0, BLOCK_SIZE_X1)).to(tl.int64)
-    offs_d2 = (pid_x2 * BLOCK_SIZE_X2 + tl.arange(0, BLOCK_SIZE_X2)).to(tl.int64)
-    offs_rd = (pid_rd * BLOCK_SIZE_RD + tl.arange(0, BLOCK_SIZE_RD)).to(tl.int64)
-
+    offs_d1 = (pid_x1 * BLOCK_SIZE_X1 + tl.arange(0, BLOCK_SIZE_X1)).to(tl.uint64)
+    offs_rd = (pid_rd * BLOCK_SIZE_RD + tl.arange(0, BLOCK_SIZE_RD)).to(tl.uint64)
     offs_x1 = offs_d1[:, None] * stride_x11 + offs_rd[None, :] * stride_x12
-    offs_x2 = offs_d2[:, None] * stride_x21 + offs_rd[None, :] * stride_x22
-    offs_out = (offs_d1[:, None] * out_d2) + (offs_d2[None, :])
 
     x1_ptrs = x1_ptr + offs_x1
-    x2_ptrs = x2_ptr + offs_x2
-    out_ptrs = out_ptr + offs_out
-
     x1_mask = (offs_d1 < out_d1)[:, None] & (offs_rd < reduced_dim)[None, :]
-    x2_mask = (offs_d2 < out_d2)[:, None] & (offs_rd < reduced_dim)[None, :]
-    out_mask = (offs_d1 < out_d1)[:, None] & (offs_d2 < out_d2)[None, :]
-
     x1 = tl.expand_dims(tl.load(x1_ptrs, mask=x1_mask), -2)
-    x2 = tl.load(x2_ptrs, mask=x2_mask)
 
-    tl.atomic_add(out_ptrs, tl.sum(tl.exp(tl.log(tl.abs(x1 - x2)) * p), axis=-1), mask=out_mask)
+    for pid_x2 in tl.range(0, tl.cdiv(out_d2, BLOCK_SIZE_X2), num_stages=4):
+        offs_d2 = (pid_x2 * BLOCK_SIZE_X2 + tl.arange(0, BLOCK_SIZE_X2)).to(tl.uint64)
+
+        offs_x2 = offs_d2[:, None] * stride_x21 + offs_rd[None, :] * stride_x22
+        offs_out = (offs_d1[:, None] * out_d2) + (offs_d2[None, :])
+
+        x2_ptrs = x2_ptr + offs_x2
+        out_ptrs = out_ptr + offs_out
+
+        x2_mask = (offs_d2 < out_d2)[:, None] & (offs_rd < reduced_dim)[None, :]
+        out_mask = (offs_d1 < out_d1)[:, None] & (offs_d2 < out_d2)[None, :]
+
+        x2 = tl.load(x2_ptrs, mask=x2_mask)
+
+        tl.atomic_add(out_ptrs, tl.sum(tl_pow(tl.abs(x1 - x2), p), axis=-1), mask=out_mask)
+
+
+@triton.jit
+def tl_pow(x, p, multiplication_loop=False):
+    if multiplication_loop:
+        res = tl.full(x.shape, 1, x.dtype)
+        for _ in tl.range(1, p.to(tl.uint8), num_stages=2):
+            res *= x
+        return res
+    else: return tl.exp(tl.log(x) * p)
 
 
 @triton_op("triton_cdist::opt_cdist_singular", mutates_args={})
@@ -62,7 +88,7 @@ def opt_cdist_singular(x1: torch.Tensor, x2: torch.Tensor,
                        out_d1: int, out_d2: int,
                        p: float) -> torch.Tensor:
     output = torch.zeros((out_d1, out_d2), device=x1.device)
-    grid = lambda meta: (triton.cdiv(x1.size(0), meta["BLOCK_SIZE_X1"]), triton.cdiv(x2.size(0), meta["BLOCK_SIZE_X2"]), triton.cdiv(x1.size(1), meta["BLOCK_SIZE_RD"]))
+    grid = lambda meta: (triton.cdiv(x1.size(0), meta["BLOCK_SIZE_X1"]), triton.cdiv(x1.size(1), meta["BLOCK_SIZE_RD"]))
 
     pairwise_lp_kernel[grid](x1, x2, output, *output.shape, x1.size(1),
                              x1.stride(0), x1.stride(1), x2.stride(0), x2.stride(1), p)
@@ -103,12 +129,7 @@ def opt_cdist(x1: torch.Tensor, x2: torch.Tensor, p: float = 2.) -> torch.Tensor
 
 
 @triton.autotune(
-        configs=[
-            triton.Config({"BLOCK_SIZE_X1": 16, "BLOCK_SIZE_X2": 16, "BLOCK_SIZE_RD": 16}, num_stages=0, num_warps=4),
-            triton.Config({"BLOCK_SIZE_X1": 16, "BLOCK_SIZE_X2": 16, "BLOCK_SIZE_RD": 16}, num_stages=0, num_warps=8),
-            triton.Config({"BLOCK_SIZE_X1": 32, "BLOCK_SIZE_X2": 32, "BLOCK_SIZE_RD": 32}, num_stages=0, num_warps=4),
-            triton.Config({"BLOCK_SIZE_X1": 32, "BLOCK_SIZE_X2": 32, "BLOCK_SIZE_RD": 32}, num_stages=0, num_warps=8),
-        ],
+        configs=get_autotune_config(),
         key=['out_d1', 'out_d2', 'reduced_dim'],
         reset_to_zero=['x1_grad_ptr', 'x2_grad_ptr'],
     )
@@ -129,44 +150,48 @@ def pairwise_lp_backward_kernel(
     BLOCK_SIZE_X2: tl.constexpr,
 ):
     pid_x1 = tl.program_id(axis=0)
-    pid_x2 = tl.program_id(axis=1)
-    pid_rd = tl.program_id(axis=2)
+    pid_rd = tl.program_id(axis=1)
 
     offs_d1 = (pid_x1 * BLOCK_SIZE_X1 + tl.arange(0, BLOCK_SIZE_X1)).to(tl.int64)
-    offs_d2 = (pid_x2 * BLOCK_SIZE_X2 + tl.arange(0, BLOCK_SIZE_X2)).to(tl.int64)
     offs_rd = (pid_rd * BLOCK_SIZE_RD + tl.arange(0, BLOCK_SIZE_RD)).to(tl.int64)
 
     offs_x1 = (offs_d1[:, None] * stride_x11 + offs_rd[None, :] * stride_x12)
-    offs_x2 = (offs_d2[:, None] * stride_x21 + offs_rd[None, :] * stride_x22)
-    offs_fwd = (offs_d1[:, None] * out_d2) + (offs_d2[None, :])
 
     x1_ptrs = x1_ptr + offs_x1
-    x2_ptrs = x2_ptr + offs_x2
-    fwdr_ptrs = fwd_res_ptr + offs_fwd
-    fwdg_ptrs = fwd_grad_ptr + offs_fwd
     x1_grad_ptrs = x1_grad_ptr + offs_x1
-    x2_grad_ptrs = x2_grad_ptr + offs_x2
 
     x1_mask = (offs_d1 < out_d1)[:, None] & (offs_rd < reduced_dim)[None, :]
-    x2_mask = (offs_d2 < out_d2)[:, None] & (offs_rd < reduced_dim)[None, :]
-    fwd_mask = (offs_d1 < out_d1)[:, None] & (offs_d2 < out_d2)[None, :]
-    grad_mask = (tl.expand_dims(x1_mask, -2) & x2_mask).permute(2, 0, 1)
 
     x1 = tl.expand_dims(tl.load(x1_ptrs, mask=x1_mask), -2)
-    x2 = tl.load(x2_ptrs, mask=x2_mask)
-    fwdr = tl.load(fwdr_ptrs, mask=fwd_mask, other=float('inf'))
-    fwdg = tl.load(fwdg_ptrs, mask=fwd_mask)
 
-    pairwise_diff = (x1 - x2).permute(2, 0, 1)
-    abs_log_diff = tl.log(pairwise_diff.abs())
-    grad_partial = (((pairwise_diff > 0) * 2) - 1) * tl.exp(abs_log_diff * (p - 1)) / fwdr
-    grad_partial = fwdg * tl.where(abs_log_diff == float('-inf'), 0., grad_partial)
+    for pid_x2 in tl.range(0, tl.cdiv(out_d2, BLOCK_SIZE_X2), num_stages=4):
+        offs_d2 = (pid_x2 * BLOCK_SIZE_X2 + tl.arange(0, BLOCK_SIZE_X2)).to(tl.int64)
+        offs_x2 = (offs_d2[:, None] * stride_x21 + offs_rd[None, :] * stride_x22)
+        offs_fwd = (offs_d1[:, None] * out_d2) + (offs_d2[None, :])
 
-    x1_grad_partial = tl.sum(tl.where(grad_mask, grad_partial, 0.), -1).trans()
-    x2_grad_partial = -tl.sum(tl.where(grad_mask, grad_partial, 0.), 1).trans()
+        x2_ptrs = x2_ptr + offs_x2
+        fwdr_ptrs = fwd_res_ptr + offs_fwd
+        fwdg_ptrs = fwd_grad_ptr + offs_fwd
+        x2_grad_ptrs = x2_grad_ptr + offs_x2
 
-    tl.atomic_add(x1_grad_ptrs, x1_grad_partial, mask=x1_mask)
-    tl.atomic_add(x2_grad_ptrs, x2_grad_partial, mask=x2_mask)
+        x2_mask = (offs_d2 < out_d2)[:, None] & (offs_rd < reduced_dim)[None, :]
+        fwd_mask = (offs_d1 < out_d1)[:, None] & (offs_d2 < out_d2)[None, :]
+        grad_mask = (tl.expand_dims(x1_mask, -2) & x2_mask).permute(2, 0, 1)
+
+        x2 = tl.load(x2_ptrs, mask=x2_mask)
+        fwdr = tl.load(fwdr_ptrs, mask=fwd_mask, other=float('inf'))
+        fwdg = tl.load(fwdg_ptrs, mask=fwd_mask)
+
+        pairwise_diff = (x1 - x2).permute(2, 0, 1)
+        log_abs_diff = tl.log(pairwise_diff.abs())
+        grad_partial = (((pairwise_diff > 0) * 2) - 1) * tl.exp(log_abs_diff * (p - 1)) / fwdr
+        grad_partial = fwdg * tl.where(log_abs_diff == float('-inf'), 0., grad_partial)
+
+        x1_grad_partial = tl.sum(tl.where(grad_mask, grad_partial, 0.), -1).trans()
+        x2_grad_partial = -tl.sum(tl.where(grad_mask, grad_partial, 0.), 1).trans()
+
+        tl.atomic_add(x1_grad_ptrs, x1_grad_partial, mask=x1_mask)
+        tl.atomic_add(x2_grad_ptrs, x2_grad_partial, mask=x2_mask)
 
 
 @triton_op("triton_cdist::opt_cdist_singular_backward", mutates_args={})
@@ -174,7 +199,7 @@ def opt_cdist_singular_backward(x1: torch.Tensor, x2: torch.Tensor, fwd_res: tor
     x1_grad = torch.zeros_like(x1)
     x2_grad = torch.zeros_like(x2)
 
-    grid = lambda meta: (triton.cdiv(x1.size(0), meta["BLOCK_SIZE_X1"]), triton.cdiv(x2.size(0), meta["BLOCK_SIZE_X2"]), triton.cdiv(x1.size(1), meta["BLOCK_SIZE_RD"]))
+    grid = lambda meta: (triton.cdiv(x1.size(0), meta["BLOCK_SIZE_X1"]), triton.cdiv(x1.size(1), meta["BLOCK_SIZE_RD"]))
 
     wrap_triton(pairwise_lp_backward_kernel)[grid](x1, x2, fwd_res, fwd_grad.clone(), x1_grad, x2_grad, *fwd_res.shape, x1.size(1),
                                                    x1.stride(0), x1.stride(1), x2.stride(0), x2.stride(1), p)
@@ -290,7 +315,7 @@ def setup_context(ctx, inputs, output):
 
 
 @opt_cdist.register_fake
-def opt_cdist_fake(x1, x2, p):
+def opt_cdist_fake(x1, x2, p=2.):
     return torch.empty([*x1.shape[:-1], x2.size(-2)])
 
 
@@ -305,8 +330,8 @@ opt_cdist.register_autograd(backward, setup_context=setup_context)
 if __name__ == '__main__':
     DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
-    x1 = torch.randn(12, 1024, 768, device=DEVICE, requires_grad=True)
-    x2 = torch.randn(50304, 768, device=DEVICE, requires_grad=True)
+    x1 = torch.randn(32, 32, device=DEVICE, requires_grad=True)
+    x2 = torch.randn(32, 32, device=DEVICE, requires_grad=True)
     print(x1, x2, sep='\n')
 
     p = 2.
